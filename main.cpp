@@ -1,14 +1,15 @@
 #include <libusb-1.0/libusb.h>
+#include <X11/Xlib.h>
+#include <X11/extensions/XTest.h>
+
 #include <iostream>
-#include <cstdlib>
-#include <chrono>
 #include <thread>
 #include <mutex>
-#include <vector>
-#include <cmath>
 #include <atomic>
+#include <cstring>
+#include <chrono>
 
-using namespace std::chrono;
+using namespace std;
 
 #define VENDOR_ID 0x258a
 #define PRODUCT_ID 0x0033
@@ -20,137 +21,126 @@ std::mutex move_mutex;
 
 std::atomic<bool> left_button_down(false);
 std::atomic<bool> right_button_down(false);
+std::atomic<bool> movement_pending(false);
 
-void moveSmoothly(int delta_x, int delta_y) {
-    if (delta_x != 0 || delta_y != 0) {
-        std::string cmd = "xdotool mousemove_relative -- ";
-        cmd += std::to_string(delta_x);
-        cmd += " ";
-        cmd += std::to_string(delta_y);
-        system(cmd.c_str());
+Display* display = nullptr;
+
+void initX11() {
+    display = XOpenDisplay(NULL);
+    if (!display) {
+        cerr << "Cannot open X11 display.\n";
+        exit(1);
     }
 }
 
-void processMovement() {
+void moveSmoothly(int dx, int dy) {
+    if (dx != 0 || dy != 0) {
+        XTestFakeRelativeMotionEvent(display, dx, dy, 0);
+        XFlush(display);
+    }
+}
+
+void movementProcessorThread() {
     while (true) {
-        std::this_thread::sleep_for(milliseconds(0));
-        int x_move, y_move;
-        {
-            std::lock_guard<std::mutex> lock(move_mutex);
-            x_move = accumulated_x;
-            y_move = accumulated_y;
-            accumulated_x = 0;
-            accumulated_y = 0;
+        if (movement_pending.load()) {
+            int dx = 0, dy = 0;
+            {
+                std::lock_guard<std::mutex> lock(move_mutex);
+                dx = accumulated_x;
+                dy = accumulated_y;
+                accumulated_x = 0;
+                accumulated_y = 0;
+                movement_pending.store(false);
+            }
+
+            if (dx != 0 || dy != 0) {
+                moveSmoothly(dx, dy);
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
-        moveSmoothly(x_move * 1, y_move * 1);
     }
 }
 
-void handleButtonClick(bool down, int button) {
-    std::string action = down ? "mousedown" : "mouseup";
-    std::string cmd = "xdotool " + action + " " + std::to_string(button);
-    system(cmd.c_str());
+void handleMouseClick(bool down, int button) {
+    XTestFakeButtonEvent(display, button, down ? True : False, 0);
+    XFlush(display);
 }
 
 void handleScroll(signed char scroll_data) {
-    if (scroll_data != 0) {
-        std::string cmd = "xdotool click ";
-        if (scroll_data > 0) {
-            cmd += "4";
-        } else {
-            cmd += "5";
-        }
-        for (int i = 0; i < std::abs(scroll_data); ++i) { 
-            system(cmd.c_str());
-            std::this_thread::sleep_for(microseconds(500)); 
-        }
+    if (scroll_data == 0) return;
+    int button = (scroll_data > 0) ? 4 : 5;
+    for (int i = 0; i < abs(scroll_data); ++i) {
+        XTestFakeButtonEvent(display, button, True, 0);
+        XTestFakeButtonEvent(display, button, False, 0);
     }
+    XFlush(display);
 }
 
 int main() {
+    initX11();
+
     libusb_context* ctx = nullptr;
     libusb_device_handle* handle = nullptr;
     libusb_init(&ctx);
 
     handle = libusb_open_device_with_vid_pid(ctx, VENDOR_ID, PRODUCT_ID);
     if (!handle) {
-        std::cerr << "Mouse not found.\n";
+        cerr << "Device not found.\n";
         return 1;
     }
 
-    if (libusb_kernel_driver_active(handle, INTERFACE) == 1) {
+    if (libusb_kernel_driver_active(handle, INTERFACE)) {
         libusb_detach_kernel_driver(handle, INTERFACE);
     }
 
     if (libusb_claim_interface(handle, INTERFACE) < 0) {
-        std::cerr << "Cannot claim interface.\n";
+        cerr << "Cannot claim interface.\n";
         return 1;
     }
 
-    unsigned char data[8];
+    unsigned char data[8] = {};
     int transferred;
-    unsigned char previous_buttons = 0;
+    unsigned char prev_buttons = 0;
 
-    std::thread movementProcessor(processMovement);
+    std::thread movementThread(movementProcessorThread);
+    movementThread.detach();
 
     while (true) {
-        int res = libusb_interrupt_transfer(handle, 0x81, data, sizeof(data), &transferred, 0);
+        int res = libusb_interrupt_transfer(handle, 0x81, data, sizeof(data), &transferred, 5);
         if (res == 0 && transferred > 0) {
-            std::cout << "Data: ";
-            for (int i = 0; i < 8; i++) {
-                std::cout << (int)data[i] << " ";
-            }
-            std::cout << std::endl;
-
-            int x_axis = (signed char)data[1];
-            int y_axis = (signed char)data[3];
-            unsigned char current_buttons = data[0];
-            signed char scroll_wheel = (signed char)data[5];
+            int dx = (signed char)data[1];
+            int dy = (signed char)data[3];
+            signed char scroll = (signed char)data[5];
+            unsigned char buttons = data[0];
 
             {
                 std::lock_guard<std::mutex> lock(move_mutex);
-                accumulated_x += x_axis;
-                accumulated_y += y_axis;
+                accumulated_x += dx;
+                accumulated_y += dy;
+                movement_pending.store(true);
             }
 
-            if ((current_buttons & 0x01) && !(previous_buttons & 0x01)) {
-                std::thread clickThread(handleButtonClick, true, 1);
-                clickThread.detach();
-                left_button_down = true;
-            } else if (!(current_buttons & 0x01) && (previous_buttons & 0x01)) {
-                std::thread clickThread(handleButtonClick, false, 1);
-                clickThread.detach();
-                left_button_down = false;
-            }
+            if ((buttons & 0x01) && !(prev_buttons & 0x01)) handleMouseClick(true, 1);
+            else if (!(buttons & 0x01) && (prev_buttons & 0x01)) handleMouseClick(false, 1);
 
-            if ((current_buttons & 0x02) && !(previous_buttons & 0x02)) {
-                std::thread clickThread(handleButtonClick, true, 3);
-                clickThread.detach();
-                right_button_down = true;
-            } else if (!(current_buttons & 0x02) && (previous_buttons & 0x02)) {
-                std::thread clickThread(handleButtonClick, false, 3);
-                clickThread.detach();
-                right_button_down = false;
-            }
+            if ((buttons & 0x02) && !(prev_buttons & 0x02)) handleMouseClick(true, 3);
+            else if (!(buttons & 0x02) && (prev_buttons & 0x02)) handleMouseClick(false, 3);
 
-            if (scroll_wheel != 0) {
-                std::thread scrollThread(handleScroll, scroll_wheel);
-                scrollThread.detach();
-            }
+            if (scroll != 0) handleScroll(scroll);
 
-            previous_buttons = current_buttons;
+            prev_buttons = buttons;
 
-        } else if (res == LIBUSB_ERROR_TIMEOUT) {
-            continue;
-        } else if (res != 0) {
-            std::cerr << "USB Error: " << libusb_error_name(res) << "\n";
+        } else if (res != LIBUSB_ERROR_TIMEOUT && res != 0) {
+            cerr << "libusb error: " << libusb_error_name(res) << "\n";
             break;
         }
     }
 
-    movementProcessor.join();
     libusb_release_interface(handle, INTERFACE);
     libusb_close(handle);
     libusb_exit(ctx);
+
+    if (display) XCloseDisplay(display);
     return 0;
 }
